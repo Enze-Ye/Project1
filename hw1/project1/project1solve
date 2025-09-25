@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-# Usage: /project/web-classes/Fall-2025/csci5471/second2tp > ct2.bin
-# Usage: python3 solve_2tp_english_only.py ct2.bin /project/.../ftable2.csv --beam 300
-
 import sys, os, csv, math, argparse
 from heapq import nlargest
 
