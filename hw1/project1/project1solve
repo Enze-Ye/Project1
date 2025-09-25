@@ -1,36 +1,41 @@
 import sys, os, csv, math, argparse
 from heapq import nlargest
 
-#Alphabet & basic helpers (space + A..Z)
-ALPH = " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-IDX  = {c:i for i,c in enumerate(ALPH)}
-V    = len(ALPH)
+#scoring alphabet (27: space + A..Z)
+SCORE_ALPH = " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+SCORE_IDX  = {c:i for i,c in enumerate(SCORE_ALPH)}
+VSCORE     = len(SCORE_ALPH)  # 27
 
-# symbol -> byte
-def sym_to_byte(si: int) -> int:              
-    return 32 if si == 0 else 64 + si
+#search alphabet (95: printable ASCII 32..126)
+SEARCH   = [i for i in range(32, 127)]
+VSEARCH  = len(SEARCH)
 
-# byte -> (symbol, penalty) ; non-letters penalized
-def loose_byte_to_sym(b: int):                
+# search index -> byte
+def sym_to_byte(si: int) -> int:          
+    return SEARCH[si]
+
+# byte -> (score_index in 0..26, penalty)
+def map_byte_for_scoring(b: int):         
     if b == 32: return 0, 0.0
     if 65 <= b <= 90:  return b - 64, 0.0
     if 97 <= b <= 122: return b - 96, 0.0
-    return 0, -8.0
+    return 0, -1.0
+                        
 # bytewise XOR
-def bxor(a: bytes, b: bytes) -> bytes:
+def bxor(a: bytes, b: bytes) -> bytes:    
     return bytes([x ^ y for x, y in zip(a, b)])
 
-# Load LM from CSV (robust): parse bigrams; derive unigrams by column sums; Laplace(+1) -> log
+#load LM from CSV (robust) -> log_uni[27], log_big[27][27]
 def load_lang_from_csv(path: str):
-    big_counts = [[0.0]*V for _ in range(V)]
-    seen = [False]*V
+    big_counts = [[0.0]*VSCORE for _ in range(VSCORE)]
+    seen = [False]*VSCORE
     with open(path, newline="") as f:
         for row in csv.reader(f):
             if not row: continue
             label = (row[0] or "").strip()
             if not label: continue
             ch = " " if label == " " else label[0].upper()
-            fi = IDX.get(ch)
+            fi = SCORE_IDX.get(ch)
             if fi is None: continue
             vals = []
             for cell in row[1:]:
@@ -38,53 +43,55 @@ def load_lang_from_csv(path: str):
                 if not cell: continue
                 try: vals.append(float(cell))
                 except ValueError: pass
-            if len(vals) >= V:
-                big_counts[fi] = vals[:V]
+            if len(vals) >= VSCORE:
+                big_counts[fi] = vals[:VSCORE]
                 seen[fi] = True
     if sum(seen) == 0:
         raise ValueError("Could not parse any bigram rows from ftable2.csv")
 
-    uni_counts = [0.0]*V
-    for fi in range(V):
-        for ni in range(V):
+    uni_counts = [0.0]*VSCORE
+    for fi in range(VSCORE):
+        for ni in range(VSCORE):
             uni_counts[ni] += big_counts[fi][ni]
 
     total_uni = sum(uni_counts)
-    log_uni = [math.log((c + 1.0) / (total_uni + V)) for c in uni_counts]
+    log_uni = [math.log((c + 1.0) / (total_uni + VSCORE)) for c in uni_counts]
 
-    log_big = [[0.0]*V for _ in range(V)]
-    for fi in range(V):
+    log_big = [[0.0]*VSCORE for _ in range(VSCORE)]
+    for fi in range(VSCORE):
         row_total = sum(big_counts[fi])
-        for ni in range(V):
-            p = (big_counts[fi][ni] + 1.0) / (row_total + V)
+        for ni in range(VSCORE):
+            p = (big_counts[fi][ni] + 1.0) / (row_total + VSCORE)
             log_big[fi][ni] = math.log(p)
     return log_uni, log_big
 
-#Beam search joint decode: p1 XOR p2 = x; maximize LM(p1)+LM(p2)
-def decode_two_english(x: bytes, log_uni, log_big, beam_width=300):
+#beam search joint decode: search over printable, score with 27-symbol LM
+def decode_two_english(x: bytes, log_uni, log_big, beam_width=600):
     k = len(x)
     beam = []
-    # init at position 0
+    # i = 0
     b0 = x[0]
-    for s1 in range(V):
+    for s1 in range(VSEARCH):
         b1 = sym_to_byte(s1)
+        s1s, pen1 = map_byte_for_scoring(b1)
         b2 = b1 ^ b0
-        s2, pen2 = loose_byte_to_sym(b2)
-        score = log_uni[s1] + log_uni[s2] + pen2
-        beam.append((score, s1, s2, bytes([b1])))
+        s2s, pen2 = map_byte_for_scoring(b2)
+        score = log_uni[s1s] + log_uni[s2s] + pen1 + pen2
+        beam.append((score, s1s, s2s, bytes([b1])))
     beam = nlargest(beam_width, beam, key=lambda t: t[0])
 
-    # step through positions 1..k-1
+    # i = 1..k-1
     for i in range(1, k):
         xi = x[i]
         new_beam = []
-        for score, last1, last2, p1_bytes in beam:
-            for s1 in range(V):
+        for score, last1s, last2s, p1_bytes in beam:
+            for s1 in range(VSEARCH):
                 b1 = sym_to_byte(s1)
+                s1s, pen1 = map_byte_for_scoring(b1)
                 b2 = b1 ^ xi
-                s2, pen2 = loose_byte_to_sym(b2)
-                sc = score + log_big[last1][s1] + log_big[last2][s2] + pen2
-                new_beam.append((sc, s1, s2, p1_bytes + bytes([b1])))
+                s2s, pen2 = map_byte_for_scoring(b2)
+                sc = score + log_big[last1s][s1s] + log_big[last2s][s2s] + pen1 + pen2
+                new_beam.append((sc, s1s, s2s, p1_bytes + bytes([b1])))
         beam = nlargest(beam_width, new_beam, key=lambda t: t[0])
 
     best = max(beam, key=lambda t: t[0])
@@ -94,10 +101,10 @@ def decode_two_english(x: bytes, log_uni, log_big, beam_width=300):
 
 #CLI & I/O
 def main():
-    ap = argparse.ArgumentParser(description="Two-Time Pad English-only solver (beam search).")
+    ap = argparse.ArgumentParser(description="Two-Time Pad English-only solver (printable search + 27-LM).")
     ap.add_argument("ct_bin", help="2048-byte ciphertext file")
     ap.add_argument("ftable_csv", help="English frequency table CSV (ftable2.csv)")
-    ap.add_argument("--beam", type=int, default=300, help="beam width (default 300)")
+    ap.add_argument("--beam", type=int, default=600, help="beam width (default 600)")
     ap.add_argument("--k", type=int, default=1024, help="per-ciphertext length (default 1024)")
     args = ap.parse_args()
 
@@ -125,3 +132,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
