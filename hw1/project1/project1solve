@@ -35,7 +35,7 @@ def recover_plaintexts(c1, c2, freq_table):
     return b"RECOVERED_TEXT_1", b"RECOVERED_TEXT_2"
 
 def main():
-    with open("second2tp_output.bin", "rb") as f:
+    with open("ct2.bin", "rb") as f:
         data = f.read()
     c1, c2 = data[:1024], data[1024:]
     freq_table = load_freq_table("ftable2.csv")
