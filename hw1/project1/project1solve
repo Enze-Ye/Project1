@@ -38,7 +38,7 @@ def main():
     with open("ct2.bin", "rb") as f:
         data = f.read()
     c1, c2 = data[:1024], data[1024:]
-    freq_table = load_freq_table("ftable2.csv")
+    freq_table = load_freq_table("/project/web-classes/Fall-2025/csci5471/hw1/ftable2.csv")
     p1, p2 = recover_plaintexts(c1, c2, freq_table)
 
     # Write outputs
