@@ -1,4 +1,4 @@
-import argparse, csv, math, os, random
+import argparse, csv, math, random
 from typing import Dict, Tuple, List
 
 # Alphabet used for search (bytes we try to place into p1)
@@ -35,10 +35,10 @@ def read_ct_pair(path: str, k: int = 1024) -> Tuple[bytes, bytes]:
 def load_lm(ftable_csv: str) -> Tuple[Dict[str, float], Dict[Tuple[str, str], float], List[str]]:
     rows = list(csv.reader(open(ftable_csv, newline="", encoding="utf-8", errors="replace")))
     header = rows[0][1:]  # symbols (space, A..Z)
-    # raw bigram counts
+
     counts: Dict[Tuple[str, str], float] = {}
     for r in rows[1:]:
-        if not r: 
+        if not r:
             continue
         a = (r[0] or " ").strip() or " "
         for i, cell in enumerate(r[1:]):
@@ -47,18 +47,18 @@ def load_lm(ftable_csv: str) -> Tuple[Dict[str, float], Dict[Tuple[str, str], fl
             except:
                 v = 0.0
             counts[(a, header[i])] = v
-    # row sums
+
     row_sum: Dict[str, float] = {}
     for (a, b), v in counts.items():
         row_sum[a] = row_sum.get(a, 0.0) + v
-    # bigram logP with Laplace(+1)
+
     K = len(header)
     log_big: Dict[Tuple[str, str], float] = {}
     for (a, b), v in counts.items():
         tot = row_sum.get(a, 0.0)
         p = (v + 1.0) / (tot + K) if tot > 0 else 1.0 / K
         log_big[(a, b)] = math.log(p)
-    # unigram from column sums (with +1 smoothing)
+
     col = {b: 1.0 for b in header}
     for (a, b), v in counts.items():
         col[b] = col.get(b, 0.0) + v
@@ -81,8 +81,8 @@ def score_seq(bs: bytes, log_uni: Dict[str, float], log_big: Dict[Tuple[str, str
 # Small word bonus to gently encourage common words
 def word_bonus(bs: bytes) -> float:
     toks = bytes(bs).decode("utf-8", "ignore").upper().split()
-    hit = sum(1 for t in toks if t in COMMON_WORDS)
-    return 0.3 * hit
+    hits = sum(1 for t in toks if t in COMMON_WORDS)
+    return 0.3 * hits
 
 # Combined objective for p1 and implied p2
 def total_obj(p1: bytes, X: bytes, log_uni, log_big) -> float:
@@ -104,22 +104,24 @@ def init_p1_unigram(X: bytes, log_uni: Dict[str, float]) -> bytearray:
         p1[i] = best_b
     return p1
 
-# Letter/space heuristic: if x[i] looks like letter after mapping, prefer one side space
+# Letter/space hint: if x[i] tends to letter after mapping, prefer one side space
 def letter_hint(xb: int) -> bool:
     ch, _ = b2sym(xb)
     return ch != " "
 
-# Hill-climb with annealed acceptance and structure hints
+# Hill-climb with annealed acceptance, hints, and progress prints
 def search(X: bytes, log_uni, log_big, restarts: int, iters: int) -> Tuple[bytes, bytes]:
     k = len(X)
     best_p1, best_val = b"", -1e18
-    for _ in range(restarts):
+    for r in range(restarts):
         p1 = init_p1_unigram(X, log_uni)
         cur = total_obj(p1, X, log_uni, log_big)
+        print(f"[restart {r+1}/{restarts}] start_score={cur:.3f}", flush=True)
+
+        last_report = -1.0
         for it in range(iters):
             i = random.randrange(k)
             xi = X[i]
-            # candidate set with hint
             if letter_hint(xi):
                 cand = [32] + [b for b in ALPHABET if b2sym(b ^ xi)[0] == " "]
             else:
@@ -131,7 +133,7 @@ def search(X: bytes, log_uni, log_big, restarts: int, iters: int) -> Tuple[bytes
             p1[i] = nb
             new = total_obj(p1, X, log_uni, log_big)
             d = new - cur
-            T = max(0.02, 1.0 - it / iters)
+            T = max(0.02, 1.0 - it / max(1, iters))
             if d >= 0 or random.random() < math.exp(d / T):
                 cur = new
                 if cur > best_val:
@@ -139,12 +141,23 @@ def search(X: bytes, log_uni, log_big, restarts: int, iters: int) -> Tuple[bytes
                     best_p1 = bytes(p1)
             else:
                 p1[i] = old
+
+            # progress print every 10k steps (and when improved a lot)
+            if (it + 1) % 10000 == 0:
+                print(f"[restart {r+1}] iter={it+1}/{iters} score={cur:.3f} best={best_val:.3f}", flush=True)
+            if cur - last_report > 5.0:
+                last_report = cur
+                # optional fine-grained improvement print
+                # print(f"[restart {r+1}] iter={it+1} improved score={cur:.3f}", flush=True)
+
+        print(f"[restart {r+1}] end_score={cur:.3f} global_best={best_val:.3f}", flush=True)
+
     p2 = bxor(best_p1, X)
     return best_p1, p2
 
 # CLI wrapper: read inputs, run search, write outputs
 def main():
-    ap = argparse.ArgumentParser(description="Two-time pad solver (English-only, LM + annealed search).")
+    ap = argparse.ArgumentParser(description="Two-time pad solver (English-only, LM + annealed search, with progress).")
     ap.add_argument("ct_bin")
     ap.add_argument("ftable_csv")
     ap.add_argument("--restarts", type=int, default=8)
@@ -166,7 +179,7 @@ def main():
     open("plain2.txt", "wb").write(p2)
     pad = bxor(c1, p1)
     open("pad.bin", "wb").write(pad)
-    print("[+] wrote plain1.txt, plain2.txt, pad.bin")
+    print("[+] wrote plain1.txt, plain2.txt, pad.bin", flush=True)
 
 if __name__ == "__main__":
     main()
