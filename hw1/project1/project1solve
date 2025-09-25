@@ -1,222 +1,154 @@
-import sys, os, csv, math, argparse, random
+import csv
+import math
+import random
 
-# Scoring alphabet for English LM: space + A..Z (27)
-SCORE_ALPH = " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-SCORE_IDX  = {c:i for i,c in enumerate(SCORE_ALPH)}
-VSCORE     = len(SCORE_ALPH)
+ALPHABET = b" ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-# Search alphabet: letters (upper/lower) + space as real bytes
-SEARCH = [32] + list(range(65,91)) + list(range(97,123))
-VSEARCH = len(SEARCH)
+# Common English words to help search
+COMMON_WORDS = [
+    "the", "and", "you", "that", "was", "this", "with", "for", "have", "not",
+    "are", "but", "had", "they", "his", "from", "she", "which", "will", "one"
+]
 
-# Bytewise XOR
-def bxor(a: bytes, b: bytes) -> bytes:
-    return bytes([x ^ y for x, y in zip(a, b)])
+def read_file(path):
+    with open(path, "rb") as f:
+        return f.read()
 
-# Map byte to scoring symbol index and penalty
-def map_byte_for_scoring(b: int):
-    if b == 32: return 0, 0.0
-    if 65 <= b <= 90:  return b - 64, 0.0
-    if 97 <= b <= 122: return b - 96, 0.0
-    return 0, -4.0
+def xor_bytes(b1, b2):
+    return bytes([a ^ b for a, b in zip(b1, b2)])
 
-# Load LM from CSV: bigrams -> log probs; unigrams by column sums
-def load_lang_from_csv(path: str):
-    big_counts = [[0.0]*VSCORE for _ in range(VSCORE)]
-    seen = [False]*VSCORE
-    with open(path, newline="") as f:
-        rdr = csv.reader(f)
-        for row in rdr:
-            if not row: 
-                continue
-            label = (row[0] or "").strip()
-            if not label:
-                continue
-            ch = " " if label == " " else label[0].upper()
-            fi = SCORE_IDX.get(ch)
-            if fi is None:
-                continue
-            vals = []
-            for cell in row[1:]:
-                cell = (cell or "").strip()
-                if not cell:
-                    continue
-                try:
-                    vals.append(float(cell))
-                except ValueError:
-                    pass
-            if len(vals) >= VSCORE:
-                big_counts[fi] = vals[:VSCORE]
-                seen[fi] = True
-    if sum(seen) == 0:
-        raise ValueError("Could not parse any bigram rows from ftable2.csv")
+# ftable2.csv to a dictionary for the probabilities
+def load_ftable(path):
+    rows = []
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.reader(f)
+        for r in reader:
+            rows.append(r)
+    header = rows[0][1:]  # skip first empty cell containing header
+    counts = {}
+    for r in rows[1:]:
+        a = r[0].strip()
+        for i, v in enumerate(r[1:]):
+            try:
+                counts[(a, header[i])] = float(v)
+            except:
+                counts[(a, header[i])] = 0.0
+    totals = {}
+    for (a, b), v in counts.items():
+        totals[a] = totals.get(a, 0.0) + v
+    logp = {}
+    floor = 1e-9  # set frequency floor to avoid math errors
+    for (a, b), v in counts.items():
+        tot = totals[a]
+        prob = floor if tot <= 0 else max(v / tot, floor)
+        logp[(a, b)] = math.log(prob)
+    return logp
 
-    uni_counts = [0.0]*VSCORE
-    for fi in range(VSCORE):
-        for ni in range(VSCORE):
-            uni_counts[ni] += big_counts[fi][ni]
+#map byte to char
+def byte_to_char(b):
+    if b == 32:
+        return " "
+    if 65 <= b <= 90:
+        return chr(b)
+    if 97 <= b <= 122:
+        return chr(b - 32)  # Convert lowercase to uppercase to lookup the score
+    return None
 
-    total_uni = sum(uni_counts)
-    log_uni = [math.log((c + 1.0) / (total_uni + VSCORE)) for c in uni_counts]
-
-    log_big = [[0.0]*VSCORE for _ in range(VSCORE)]
-    for fi in range(VSCORE):
-        row_total = sum(big_counts[fi])
-        for ni in range(VSCORE):
-            p = (big_counts[fi][ni] + 1.0) / (row_total + VSCORE)
-            log_big[fi][ni] = math.log(p)
-    return log_uni, log_big
-
-# Convert real bytes to scoring indices and penalties
-def bytes_to_scores(bs: bytearray):
-    idx = [0]*len(bs)
-    pen = [0.0]*len(bs)
-    for i,b in enumerate(bs):
-        s, p = map_byte_for_scoring(b)
-        idx[i] = s
-        pen[i] = p
-    return idx, pen
-
-# Compute total LM score for both strings (sum of bigrams + penalties)
-def total_score(idx1, idx2, pen1, pen2, log_uni, log_big):
-    k = len(idx1)
-    s = (log_uni[idx1[0]] + log_uni[idx2[0]] + pen1[0] + pen2[0])
-    for i in range(1,k):
-        s += log_big[idx1[i-1]][idx1[i]] + log_big[idx2[i-1]][idx2[i]] + pen1[i] + pen2[i]
+#score with bigram scores, penalty for not found
+def score_bigram(b, logp):
+    s = 0.0
+    penalty = -100.0
+    for i in range(len(b) - 1):
+        a = byte_to_char(b[i])
+        c = byte_to_char(b[i + 1])
+        if a is None or c is None:
+            s += penalty
+        else:
+            s += logp.get((a, c), math.log(1e-9))
     return s
 
-# Local delta when changing position i from old byte -> new byte
-def local_delta(i, new_b1, p1, idx1, pen1, p2, idx2, pen2, x, log_uni, log_big):
-    k = len(p1)
-    old_b1 = p1[i]
-    if new_b1 == old_b1:
-        return 0.0
+# Bonus score for common English words
+def word_bonus_score(text):
+    text_lower = text.lower()
+    bonus = 0
+    for word in COMMON_WORDS:
+        bonus += text_lower.count(word) * 10000  # 10,000 points per occurrence
+    return bonus
 
-    # old/new mapped symbols and penalties
-    old_s1, old_p1 = map_byte_for_scoring(old_b1)
-    new_s1, new_p1 = map_byte_for_scoring(new_b1)
+def combined_score(candidate_bytes, logp):
+    base_score = score_bigram(candidate_bytes, logp)
+    try:
+        as_text = candidate_bytes.decode('utf-8', errors='ignore')
+    except:
+        as_text = "" 
+    bonus = word_bonus_score(as_text)
+    return base_score + bonus
 
-    old_b2 = p2[i]
-    new_b2 = new_b1 ^ x[i]
-    old_s2, old_p2 = map_byte_for_scoring(old_b2)
-    new_s2, new_p2 = map_byte_for_scoring(new_b2)
+# Bulk algorithm with hill climbing and random restarts, XORing two ciphertexts and returning the best plaintexts
+def hillclimb(X, logp, restarts=20, iterations=3000):
+    k = len(X)
+    best_pair, best_score = (b"", b""), -1e18  # Initialize low best score
 
-    # start with unigram/bigram differences around position i
-    d = 0.0
-    # position i unigram
-    if i == 0:
-        d += (new_p1 + new_p2 + log_uni[new_s1] + log_uni[new_s2]) - (old_p1 + old_p2 + log_uni[old_s1] + log_uni[old_s2])
-    else:
-        # p1 side
-        d += log_big[idx1[i-1]][new_s1] - log_big[idx1[i-1]][old_s1]
-        # p2 side
-        d += log_big[idx2[i-1]][new_s2] - log_big[idx2[i-1]][old_s2]
+    for r in range(restarts):
+        p1 = bytearray([32] * k)
+        cur_score = combined_score(p1, logp) + combined_score(xor_bytes(p1, X), logp)
 
-    if i+1 < k:
-        # p1 side
-        d += log_big[new_s1][idx1[i+1]] - log_big[old_s1][idx1[i+1]]
-        # p2 side
-        d += log_big[new_s2][idx2[i+1]] - log_big[old_s2][idx2[i+1]]
+        #random pick and propose mutation
+        for it in range(iterations):
+            i = random.randrange(k)
+            old = p1[i]
+            proposal = random.choice(ALPHABET)
+            p1[i] = proposal
 
-    return d
+            new_score = combined_score(p1, logp) + combined_score(xor_bytes(p1, X), logp)
+            delta = new_score - cur_score
 
-# Simulated annealing over p1; p2 = p1 ^ x is implied
-def anneal(x: bytes, log_uni, log_big, steps=400000, t0=1.5, t1=0.05):
-    k = len(x)
+            # Simulate the rest of the mutation 
+            T = max(0.01, 1.0 - it / iterations)
+            if delta >= 0 or random.random() < math.exp(delta / T):
+                cur_score = new_score
+                if new_score > best_score:
+                    best_score = new_score
+                    best_pair = (bytes(p1), xor_bytes(bytes(p1), X))
+            else:
+                p1[i] = old  # revert mutation if not accepted
 
-    # init p1 greedily by unigram: for each i, pick b that maximizes log_uni[s1]+log_uni[s2]
-    p1 = bytearray(k)
-    for i,xi in enumerate(x):
-        best_b = 32
-        best_sc = -1e100
-        for b1 in SEARCH:
-            s1, p1pen = map_byte_for_scoring(b1)
-            b2 = b1 ^ xi
-            s2, p2pen = map_byte_for_scoring(b2)
-            sc = (log_uni[s1] + log_uni[s2] + p1pen + p2pen)
-            if sc > best_sc:
-                best_sc = sc
-                best_b = b1
-        p1[i] = best_b
-
-    p2 = bytearray([p1[i] ^ x[i] for i in range(k)])
-    idx1, pen1 = bytes_to_scores(p1)
-    idx2, pen2 = bytes_to_scores(p2)
-    cur = total_score(idx1, idx2, pen1, pen2, log_uni, log_big)
-    best = cur
-    best_p1 = p1[:]
-
-    # anneal
-    for it in range(steps):
-        # temperature schedule
-        t = t0 * (t1 / t0) ** (it / max(1, steps-1))
-
-        i = random.randrange(k)
-        new_b1 = random.choice(SEARCH)
-        d = local_delta(i, new_b1, p1, idx1, pen1, p2, idx2, pen2, x, log_uni, log_big)
-
-        if d >= 0 or random.random() < math.exp(d / max(1e-8, t)):
-            # accept
-            old_b1 = p1[i]
-            old_s1 = idx1[i]
-            old_b2 = p2[i]
-            old_s2 = idx2[i]
-
-            p1[i] = new_b1
-            p2[i] = new_b1 ^ x[i]
-
-            s1, p1pen = map_byte_for_scoring(new_b1)
-            s2, p2pen = map_byte_for_scoring(p2[i])
-
-            idx1[i] = s1; pen1[i] = p1pen
-            idx2[i] = s2; pen2[i] = p2pen
-            cur += d
-
-            if cur > best:
-                best = cur
-                best_p1 = p1[:]
-        # optional: occasional greedy refinement
-        if (it+1) % 50000 == 0:
-            pass
-
-    final_p1 = best_p1
-    final_p2 = bytes([final_p1[i] ^ x[i] for i in range(k)])
-    return bytes(final_p1), final_p2
-
-# CLI entrypoint: read inputs, run SA solver, write outputs
-def main():
-    ap = argparse.ArgumentParser(description="Two-Time Pad English-only solver via simulated annealing.")
-    ap.add_argument("ct_bin", help="2048-byte ciphertext file from second2tp")
-    ap.add_argument("ftable_csv", help="English frequency table CSV (ftable2.csv)")
-    ap.add_argument("--k", type=int, default=1024, help="per-ciphertext length (default 1024)")
-    ap.add_argument("--steps", type=int, default=400000, help="annealing steps (default 400k)")
-    ap.add_argument("--seed", type=int, default=0, help="random seed (0 to use OS entropy)")
-    args = ap.parse_args()
-
-    if args.seed:
-        random.seed(args.seed)
-
-    data = open(args.ct_bin, "rb").read()
-    if len(data) != 2*args.k:
-        print(f"Error: expected {2*args.k} bytes, got {len(data)}", file=sys.stderr)
-        sys.exit(2)
-
-    c1, c2 = data[:args.k], data[args.k:]
-    x = bxor(c1, c2)
-
-    log_uni, log_big = load_lang_from_csv(args.ftable_csv)
-    p1, p2 = anneal(x, log_uni, log_big, steps=args.steps)
-
-    pad1 = bxor(c1, p1)
-    pad2 = bxor(c2, p2)
-    if pad1 != pad2:
-        print("Warning: pad mismatch; results may be degraded.", file=sys.stderr)
-    pad = pad1
-
-    open("plain1.txt", "wb").write(p1)
-    open("plain2.txt", "wb").write(p2)
-    open("pad.bin", "wb").write(pad)
-    print("[+] Wrote plain1.txt, plain2.txt, pad.bin")
+    return best_pair, best_score
 
 if __name__ == "__main__":
-    main()
+    # Prep pojrect environment by splitting ciphertexts.bin into two files
+    with open('ciphertexts.bin', 'rb') as f:
+        data = f.read()
+    assert len(data) == 2048, "ciphertexts.bin must be 2048 bytes"
+    with open('file1.bin', 'wb') as f1:
+        f1.write(data[:1024])
+    with open('file2.bin', 'wb') as f2:
+        f2.write(data[1024:])
+
+    c1_path = "file1.bin"
+    c2_path = "file2.bin"
+    ftable_path = "ftable2.csv"
+    restarts = 20
+    iterations = 3000
+
+    c1 = read_file(c1_path)
+    c2 = read_file(c2_path)
+    if len(c1) != len(c2):
+        print("Ciphertexts must be the same length")
+        exit(1)
+
+    X = xor_bytes(c1, c2)
+
+    logp = load_ftable(ftable_path)
+
+    (p1, p2), sc = hillclimb(X, logp, restarts=restarts, iterations=iterations)
+
+    # Output recovered plaintexts to text file
+    with open("recovered_plaintexts.txt", "w", encoding="utf-8") as f:
+        f.write("--- Plaintext 1 ---\n")
+        f.write(p1.decode("utf-8", errors="replace") + "\n\n")
+        f.write("--- Plaintext 2 ---\n")
+        f.write(p2.decode("utf-8", errors="replace") + "\n")
+
+    print("Done. Best score:", sc)
+    print("Recovered plaintexts written to recovered_plaintexts.txt")
