@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+# Usage: /project/web-classes/Fall-2025/csci5471/second2tp > ct2.bin
+# Usage: python3 solve_2tp_english_only.py ct2.bin /project/.../ftable2.csv --beam 300
+
+import sys, os, csv, math, argparse
+from heapq import nlargest
+
+#Alphabet & basic helpers (space + A..Z)
+ALPH = " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+IDX  = {c:i for i,c in enumerate(ALPH)}
+V    = len(ALPH)
+
+# symbol -> byte
+def sym_to_byte(si: int) -> int:              
+    return 32 if si == 0 else 64 + si
+
+# byte -> (symbol, penalty) ; non-letters penalized
+def loose_byte_to_sym(b: int):                
+    if b == 32: return 0, 0.0
+    if 65 <= b <= 90:  return b - 64, 0.0
+    if 97 <= b <= 122: return b - 96, 0.0
+    return 0, -8.0
+# bytewise XOR
+def bxor(a: bytes, b: bytes) -> bytes:
+    return bytes([x ^ y for x, y in zip(a, b)])
+
+# Load LM from CSV (robust): parse bigrams; derive unigrams by column sums; Laplace(+1) -> log
+def load_lang_from_csv(path: str):
+    big_counts = [[0.0]*V for _ in range(V)]
+    seen = [False]*V
+    with open(path, newline="") as f:
+        for row in csv.reader(f):
+            if not row: continue
+            label = (row[0] or "").strip()
+            if not label: continue
+            ch = " " if label == " " else label[0].upper()
+            fi = IDX.get(ch)
+            if fi is None: continue
+            vals = []
+            for cell in row[1:]:
+                cell = (cell or "").strip()
+                if not cell: continue
+                try: vals.append(float(cell))
+                except ValueError: pass
+            if len(vals) >= V:
+                big_counts[fi] = vals[:V]
+                seen[fi] = True
+    if sum(seen) == 0:
+        raise ValueError("Could not parse any bigram rows from ftable2.csv")
+
+    uni_counts = [0.0]*V
+    for fi in range(V):
+        for ni in range(V):
+            uni_counts[ni] += big_counts[fi][ni]
+
+    total_uni = sum(uni_counts)
+    log_uni = [math.log((c + 1.0) / (total_uni + V)) for c in uni_counts]
+
+    log_big = [[0.0]*V for _ in range(V)]
+    for fi in range(V):
+        row_total = sum(big_counts[fi])
+        for ni in range(V):
+            p = (big_counts[fi][ni] + 1.0) / (row_total + V)
+            log_big[fi][ni] = math.log(p)
+    return log_uni, log_big
+
+#Beam search joint decode: p1 XOR p2 = x; maximize LM(p1)+LM(p2)
+def decode_two_english(x: bytes, log_uni, log_big, beam_width=300):
+    k = len(x)
+    beam = []
+    # init at position 0
+    b0 = x[0]
+    for s1 in range(V):
+        b1 = sym_to_byte(s1)
+        b2 = b1 ^ b0
+        s2, pen2 = loose_byte_to_sym(b2)
+        score = log_uni[s1] + log_uni[s2] + pen2
+        beam.append((score, s1, s2, bytes([b1])))
+    beam = nlargest(beam_width, beam, key=lambda t: t[0])
+
+    # step through positions 1..k-1
+    for i in range(1, k):
+        xi = x[i]
+        new_beam = []
+        for score, last1, last2, p1_bytes in beam:
+            for s1 in range(V):
+                b1 = sym_to_byte(s1)
+                b2 = b1 ^ xi
+                s2, pen2 = loose_byte_to_sym(b2)
+                sc = score + log_big[last1][s1] + log_big[last2][s2] + pen2
+                new_beam.append((sc, s1, s2, p1_bytes + bytes([b1])))
+        beam = nlargest(beam_width, new_beam, key=lambda t: t[0])
+
+    best = max(beam, key=lambda t: t[0])
+    p1 = best[3]
+    p2 = bxor(p1, x)
+    return p1, p2
+
+#CLI & I/O
+def main():
+    ap = argparse.ArgumentParser(description="Two-Time Pad English-only solver (beam search).")
+    ap.add_argument("ct_bin", help="2048-byte ciphertext file")
+    ap.add_argument("ftable_csv", help="English frequency table CSV (ftable2.csv)")
+    ap.add_argument("--beam", type=int, default=300, help="beam width (default 300)")
+    ap.add_argument("--k", type=int, default=1024, help="per-ciphertext length (default 1024)")
+    args = ap.parse_args()
+
+    data = open(args.ct_bin, "rb").read()
+    if len(data) != 2*args.k:
+        print(f"Error: expected {2*args.k} bytes, got {len(data)}", file=sys.stderr)
+        sys.exit(2)
+
+    c1, c2 = data[:args.k], data[args.k:]
+    x = bxor(c1, c2)
+
+    log_uni, log_big = load_lang_from_csv(args.ftable_csv)
+    p1, p2 = decode_two_english(x, log_uni, log_big, beam_width=args.beam)
+
+    pad1 = bxor(c1, p1)
+    pad2 = bxor(c2, p2)
+    if pad1 != pad2:
+        print("Warning: pad mismatch; results may be degraded.", file=sys.stderr)
+    pad = pad1
+
+    open("plain1.txt", "wb").write(p1)
+    open("plain2.txt", "wb").write(p2)
+    open("pad.bin", "wb").write(pad)
+    print("[+] Wrote plain1.txt, plain2.txt, pad.bin")
+
+if __name__ == "__main__":
+    main()
