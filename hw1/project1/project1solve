@@ -7,8 +7,8 @@ SCORE_IDX  = {c:i for i,c in enumerate(SCORE_ALPH)}
 VSCORE     = len(SCORE_ALPH)  # 27
 
 # Search alphabet over printable ASCII bytes 32..126 (95)
-SEARCH   = [i for i in range(32, 127)]
-VSEARCH  = len(SEARCH)
+SEARCH = [32] + list(range(65, 91)) + list(range(97, 123))  
+VSEARCH = len(SEARCH)
 
 # Convert a search index to its actual byte value
 def sym_to_byte(si: int) -> int:
@@ -19,7 +19,7 @@ def map_byte_for_scoring(b: int):
     if b == 32: return 0, 0.0
     if 65 <= b <= 90:  return b - 64, 0.0
     if 97 <= b <= 122: return b - 96, 0.0
-    return 0, -0.5
+    return 0, -4.0
 
 # Test if a byte is an ASCII letter
 def is_alpha_byte(b: int) -> bool:
