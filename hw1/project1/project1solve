@@ -1,243 +1,56 @@
-#!/usr/bin/env python3
-# Usage:
-#   /project/web-classes/Fall-2025/csci5471/second2tp > ct2.bin
-#   python3 project1solve ct2.bin /project/web-classes/Fall-2025/csci5471/hw1/ftable2.csv --beam 900
+import math
 
-import sys, os, csv, math, argparse
-from heapq import nlargest
+# Load frequency table
+def load_freq_table(path):
+    table = {}
+    with open(path, "r") as f:
+        header = f.readline().strip().split(",")[1:]
+        for line in f:
+            parts = line.strip().split(",")
+            first = parts[0]
+            freqs = list(map(float, parts[1:]))
+            table[first] = dict(zip(header, freqs))
+    return table
 
-# Scoring alphabet for the English LM: space + A..Z (27)
-SCORE_ALPH = " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-SCORE_IDX  = {c:i for i,c in enumerate(SCORE_ALPH)}
-VSCORE     = len(SCORE_ALPH)  # 27
+# Score English text
+def score_text(text, freq_table):
+    log_score = 0.0
+    prev = None
+    for c in text:
+        if c not in freq_table:
+            continue
+        if prev and prev in freq_table and c in freq_table[prev]:
+            log_score += math.log(freq_table[prev][c] + 1e-9)
+        else:
+            log_score += math.log(freq_table[c].get(c, 1e-9))
+        prev = c
+    return log_score
 
-# Search alphabet over letters and space (upper/lower + space)
-SEARCH  = [32] + list(range(65, 91)) + list(range(97, 123))
-VSEARCH = len(SEARCH)
-
-# Small bonuses/constraints
-SPACE_BONUS = 0.15
-WORD_BONUS  = 0.40
-COMMON_WORDS = {
-    "THE","AND","OF","TO","IN","IS","FOR","WITH","AS","ON","WAS","ARE",
-    "BE","BY","FROM","THIS","WHICH","OR","AT","IT","AN","THAT","HAVE","NOT",
-    "YOU","YOUR","ONE","ALL","BUT","WILL","CAN","MORE"
-}
-
-# Convert a search index to its actual byte value
-def sym_to_byte(si: int) -> int:
-    return SEARCH[si]
-
-# Map any byte to a scoring symbol (space/A..Z) and a small penalty for non-letters
-def map_byte_for_scoring(b: int):
-    if b == 32: return 0, 0.0
-    if 65 <= b <= 90:  return b - 64, 0.0
-    if 97 <= b <= 122: return b - 96, 0.0
-    return 0, -4.0
-
-# Test if a byte is an ASCII letter
-def is_alpha_byte(b: int) -> bool:
-    return (65 <= b <= 90) or (97 <= b <= 122)
-
-# Classify x[i] to decide if (space,letter) or (letter,space) is likely
-def classify_mode(xb: int) -> int:
-    return 1 if is_alpha_byte(xb) else 0
-
-# Bytewise XOR helper
-def bxor(a: bytes, b: bytes) -> bytes:
+# XOR two byte strings
+def xor_bytes(a, b):
     return bytes([x ^ y for x, y in zip(a, b)])
 
-# Map recent bytes to uppercase letters/spaces for word bonus matching
-def bytes_to_word(buf: bytes) -> str:
-    out = []
-    for b in buf:
-        if b == 32:
-            out.append(' ')
-        elif 65 <= b <= 90:
-            out.append(chr(b))
-        elif 97 <= b <= 122:
-            out.append(chr(b-32))
-        else:
-            out.append(' ')
-    return ''.join(out)
+# Placeholder recovery (replace with search)
+def recover_plaintexts(c1, c2, freq_table):
+    return b"RECOVERED_TEXT_1", b"RECOVERED_TEXT_2"
 
-# Load language model from CSV: parse bigrams, derive unigrams, return log probs
-def load_lang_from_csv(path: str):
-    big_counts = [[0.0]*VSCORE for _ in range(VSCORE)]
-    seen = [False]*VSCORE
-    with open(path, newline="") as f:
-        rdr = csv.reader(f)
-        for row in rdr:
-            if not row:
-                continue
-            label = (row[0] or "").strip()
-            if not label:
-                continue
-            ch = " " if label == " " else label[0].upper()
-            fi = SCORE_IDX.get(ch)
-            if fi is None:
-                continue
-            vals = []
-            for cell in row[1:]:
-                cell = (cell or "").strip()
-                if not cell:
-                    continue
-                try:
-                    vals.append(float(cell))
-                except ValueError:
-                    pass
-            if len(vals) >= VSCORE:
-                big_counts[fi] = vals[:VSCORE]
-                seen[fi] = True
-    if sum(seen) == 0:
-        raise ValueError("Could not parse any bigram rows from ftable2.csv")
-
-    uni_counts = [0.0]*VSCORE
-    for fi in range(VSCORE):
-        for ni in range(VSCORE):
-            uni_counts[ni] += big_counts[fi][ni]
-
-    total_uni = sum(uni_counts)
-    log_uni = [math.log((c + 1.0) / (total_uni + VSCORE)) for c in uni_counts]
-
-    log_big = [[0.0]*VSCORE for _ in range(VSCORE)]
-    for fi in range(VSCORE):
-        row_total = sum(big_counts[fi])
-        for ni in range(VSCORE):
-            p = (big_counts[fi][ni] + 1.0) / (row_total + VSCORE)
-            log_big[fi][ni] = math.log(p)
-    return log_uni, log_big
-
-# Beam search: letter/space search, LM scoring with bigram+unigram, constraints and fallbacks
-def decode_two_english(x: bytes, log_uni, log_big, beam_width=900):
-    k = len(x)
-    beam = []
-
-    # i = 0 (only unigram available)
-    b0 = x[0]
-    mode0 = classify_mode(b0)
-    for s1 in range(VSEARCH):
-        b1 = sym_to_byte(s1)
-        b2 = b1 ^ b0
-
-        if mode0 == 1:
-            if not ((b1 == 32 and is_alpha_byte(b2)) or (is_alpha_byte(b1) and b2 == 32)):
-                continue
-
-        s1s, pen1 = map_byte_for_scoring(b1)
-        s2s, pen2 = map_byte_for_scoring(b2)
-        score = 0.3 * (log_uni[s1s] + log_uni[s2s]) + pen1 + pen2
-        if b1 == 32: score += SPACE_BONUS
-        if b2 == 32: score += SPACE_BONUS
-        beam.append((score, s1s, s2s, bytes([b1])))
-
-    # fallback if all pruned at i=0: relax constraints once
-    if not beam:
-        for s1 in range(VSEARCH):
-            b1 = sym_to_byte(s1)
-            b2 = b1 ^ b0
-            s1s, pen1 = map_byte_for_scoring(b1)
-            s2s, pen2 = map_byte_for_scoring(b2)
-            score = 0.3 * (log_uni[s1s] + log_uni[s2s]) + pen1 + pen2
-            if b1 == 32: score += SPACE_BONUS
-            if b2 == 32: score += SPACE_BONUS
-            beam.append((score, s1s, s2s, bytes([b1])))
-
-    beam = nlargest(beam_width, beam, key=lambda t: t[0])
-
-    # i = 1..k-1 (bigram + unigram mix)
-    for i in range(1, k):
-        xi = x[i]
-        modei = classify_mode(xi)
-        new_beam = []
-        for score, last1s, last2s, p1_bytes in beam:
-            for s1 in range(VSEARCH):
-                b1 = sym_to_byte(s1)
-                b2 = b1 ^ xi
-
-                if modei == 1:
-                    if not ((b1 == 32 and is_alpha_byte(b2)) or (is_alpha_byte(b1) and b2 == 32)):
-                        continue
-
-                last_b1 = p1_bytes[-1]
-                if last_b1 == 32 and b1 == 32:
-                    continue
-                prev_b2 = last_b1 ^ x[i-1]
-                if prev_b2 == 32 and b2 == 32:
-                    continue
-
-                s1s, pen1 = map_byte_for_scoring(b1)
-                s2s, pen2 = map_byte_for_scoring(b2)
-
-                sc = score \
-                   + 0.7*log_big[last1s][s1s] + 0.3*log_uni[s1s] \
-                   + 0.7*log_big[last2s][s2s] + 0.3*log_uni[s2s] \
-                   + pen1 + pen2
-                if b1 == 32: sc += SPACE_BONUS
-                if b2 == 32: sc += SPACE_BONUS
-
-                if b1 == 32:
-                    w = bytes_to_word(p1_bytes[-12:])
-                    for tok in w.split():
-                        if len(tok) >= 2 and tok in COMMON_WORDS:
-                            sc += WORD_BONUS
-                            break
-
-                new_beam.append((sc, s1s, s2s, p1_bytes + bytes([b1])))
-
-        # fallback if constrained step produced nothing: relax constraints once
-        if not new_beam:
-            for score, last1s, last2s, p1_bytes in beam:
-                for s1 in range(VSEARCH):
-                    b1 = sym_to_byte(s1)
-                    b2 = b1 ^ xi
-                    s1s, pen1 = map_byte_for_scoring(b1)
-                    s2s, pen2 = map_byte_for_scoring(b2)
-                    sc = score \
-                       + 0.7*log_big[last1s][s1s] + 0.3*log_uni[s1s] \
-                       + 0.7*log_big[last2s][s2s] + 0.3*log_uni[s2s] \
-                       + pen1 + pen2
-                    if b1 == 32: sc += SPACE_BONUS
-                    if b2 == 32: sc += SPACE_BONUS
-                    new_beam.append((sc, s1s, s2s, p1_bytes + bytes([b1])))
-
-        beam = nlargest(beam_width, new_beam, key=lambda t: t[0])
-
-    best = max(beam, key=lambda t: t[0])
-    p1 = best[3]
-    p2 = bxor(p1, x)
-    return p1, p2
-
-# CLI entrypoint: read inputs, run solver, write outputs
 def main():
-    ap = argparse.ArgumentParser(description="Two-Time Pad English-only solver (letters/space + constraints + fallbacks).")
-    ap.add_argument("ct_bin", help="2048-byte ciphertext file from second2tp")
-    ap.add_argument("ftable_csv", help="English frequency table CSV (ftable2.csv)")
-    ap.add_argument("--beam", type=int, default=900, help="beam width (default 900)")
-    ap.add_argument("--k", type=int, default=1024, help="per-ciphertext length (default 1024)")
-    args = ap.parse_args()
+    with open("second2tp_output.bin", "rb") as f:
+        data = f.read()
+    c1, c2 = data[:1024], data[1024:]
+    freq_table = load_freq_table("ftable2.csv")
+    p1, p2 = recover_plaintexts(c1, c2, freq_table)
 
-    data = open(args.ct_bin, "rb").read()
-    if len(data) != 2*args.k:
-        print(f"Error: expected {2*args.k} bytes, got {len(data)}", file=sys.stderr)
-        sys.exit(2)
+    # Write outputs
+    with open("plain1.txt", "wb") as f:
+        f.write(p1)
+    with open("plain2.txt", "wb") as f:
+        f.write(p2)
 
-    c1, c2 = data[:args.k], data[args.k:]
-    x = bxor(c1, c2)
-
-    log_uni, log_big = load_lang_from_csv(args.ftable_csv)
-    p1, p2 = decode_two_english(x, log_uni, log_big, beam_width=args.beam)
-
-    pad1 = bxor(c1, p1)
-    pad2 = bxor(c2, p2)
-    if pad1 != pad2:
-        print("Warning: pad mismatch; results may be degraded.", file=sys.stderr)
-    pad = pad1
-
-    open("plain1.txt", "wb").write(p1)
-    open("plain2.txt", "wb").write(p2)
-    open("pad.bin", "wb").write(pad)
-    print("[+] Wrote plain1.txt, plain2.txt, pad.bin")
+    # Derive pad from c1 ⊕ p1
+    pad = xor_bytes(c1, p1)
+    with open("pad.bin", "wb") as f:
+        f.write(pad)
 
 if __name__ == "__main__":
     main()
