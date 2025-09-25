@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+# Usage:
+#   /project/web-classes/Fall-2025/csci5471/second2tp > ct2.bin
+#   python3 project1solve ct2.bin /project/web-classes/Fall-2025/csci5471/hw1/ftable2.csv --beam 900
+
 import sys, os, csv, math, argparse
 from heapq import nlargest
 
@@ -7,7 +12,7 @@ SCORE_IDX  = {c:i for i,c in enumerate(SCORE_ALPH)}
 VSCORE     = len(SCORE_ALPH)  # 27
 
 # Search alphabet over letters and space (upper/lower + space)
-SEARCH = [32] + list(range(65, 91)) + list(range(97, 123))
+SEARCH  = [32] + list(range(65, 91)) + list(range(97, 123))
 VSEARCH = len(SEARCH)
 
 # Small bonuses/constraints
@@ -15,7 +20,8 @@ SPACE_BONUS = 0.15
 WORD_BONUS  = 0.40
 COMMON_WORDS = {
     "THE","AND","OF","TO","IN","IS","FOR","WITH","AS","ON","WAS","ARE",
-    "BE","BY","FROM","THIS","WHICH","OR","AT","IT","AN","THAT","HAVE","NOT"
+    "BE","BY","FROM","THIS","WHICH","OR","AT","IT","AN","THAT","HAVE","NOT",
+    "YOU","YOUR","ONE","ALL","BUT","WILL","CAN","MORE"
 }
 
 # Convert a search index to its actual byte value
@@ -62,7 +68,7 @@ def load_lang_from_csv(path: str):
     with open(path, newline="") as f:
         rdr = csv.reader(f)
         for row in rdr:
-            if not row: 
+            if not row:
                 continue
             label = (row[0] or "").strip()
             if not label:
@@ -102,8 +108,8 @@ def load_lang_from_csv(path: str):
             log_big[fi][ni] = math.log(p)
     return log_uni, log_big
 
-# Beam search: letter/space search, LM scoring with bigram+unigram, constraints and small bonuses
-def decode_two_english(x: bytes, log_uni, log_big, beam_width=600):
+# Beam search: letter/space search, LM scoring with bigram+unigram, constraints and fallbacks
+def decode_two_english(x: bytes, log_uni, log_big, beam_width=900):
     k = len(x)
     beam = []
 
@@ -124,6 +130,19 @@ def decode_two_english(x: bytes, log_uni, log_big, beam_width=600):
         if b1 == 32: score += SPACE_BONUS
         if b2 == 32: score += SPACE_BONUS
         beam.append((score, s1s, s2s, bytes([b1])))
+
+    # fallback if all pruned at i=0: relax constraints once
+    if not beam:
+        for s1 in range(VSEARCH):
+            b1 = sym_to_byte(s1)
+            b2 = b1 ^ b0
+            s1s, pen1 = map_byte_for_scoring(b1)
+            s2s, pen2 = map_byte_for_scoring(b2)
+            score = 0.3 * (log_uni[s1s] + log_uni[s2s]) + pen1 + pen2
+            if b1 == 32: score += SPACE_BONUS
+            if b2 == 32: score += SPACE_BONUS
+            beam.append((score, s1s, s2s, bytes([b1])))
+
     beam = nlargest(beam_width, beam, key=lambda t: t[0])
 
     # i = 1..k-1 (bigram + unigram mix)
@@ -140,7 +159,6 @@ def decode_two_english(x: bytes, log_uni, log_big, beam_width=600):
                     if not ((b1 == 32 and is_alpha_byte(b2)) or (is_alpha_byte(b1) and b2 == 32)):
                         continue
 
-                # forbid double spaces on either side
                 last_b1 = p1_bytes[-1]
                 if last_b1 == 32 and b1 == 32:
                     continue
@@ -158,15 +176,31 @@ def decode_two_english(x: bytes, log_uni, log_big, beam_width=600):
                 if b1 == 32: sc += SPACE_BONUS
                 if b2 == 32: sc += SPACE_BONUS
 
-                # common short word bonus on p1 when a word just closed (space just chosen)
                 if b1 == 32:
-                    w = bytes_to_word(p1_bytes[-12:])  # recent window
+                    w = bytes_to_word(p1_bytes[-12:])
                     for tok in w.split():
                         if len(tok) >= 2 and tok in COMMON_WORDS:
                             sc += WORD_BONUS
                             break
 
                 new_beam.append((sc, s1s, s2s, p1_bytes + bytes([b1])))
+
+        # fallback if constrained step produced nothing: relax constraints once
+        if not new_beam:
+            for score, last1s, last2s, p1_bytes in beam:
+                for s1 in range(VSEARCH):
+                    b1 = sym_to_byte(s1)
+                    b2 = b1 ^ xi
+                    s1s, pen1 = map_byte_for_scoring(b1)
+                    s2s, pen2 = map_byte_for_scoring(b2)
+                    sc = score \
+                       + 0.7*log_big[last1s][s1s] + 0.3*log_uni[s1s] \
+                       + 0.7*log_big[last2s][s2s] + 0.3*log_uni[s2s] \
+                       + pen1 + pen2
+                    if b1 == 32: sc += SPACE_BONUS
+                    if b2 == 32: sc += SPACE_BONUS
+                    new_beam.append((sc, s1s, s2s, p1_bytes + bytes([b1])))
+
         beam = nlargest(beam_width, new_beam, key=lambda t: t[0])
 
     best = max(beam, key=lambda t: t[0])
@@ -176,10 +210,10 @@ def decode_two_english(x: bytes, log_uni, log_big, beam_width=600):
 
 # CLI entrypoint: read inputs, run solver, write outputs
 def main():
-    ap = argparse.ArgumentParser(description="Two-Time Pad English-only solver (letters/space + constraints).")
+    ap = argparse.ArgumentParser(description="Two-Time Pad English-only solver (letters/space + constraints + fallbacks).")
     ap.add_argument("ct_bin", help="2048-byte ciphertext file from second2tp")
     ap.add_argument("ftable_csv", help="English frequency table CSV (ftable2.csv)")
-    ap.add_argument("--beam", type=int, default=600, help="beam width (default 600)")
+    ap.add_argument("--beam", type=int, default=900, help="beam width (default 900)")
     ap.add_argument("--k", type=int, default=1024, help="per-ciphertext length (default 1024)")
     args = ap.parse_args()
 
