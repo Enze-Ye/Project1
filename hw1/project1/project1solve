@@ -1,174 +1,193 @@
 #!/usr/bin/env python3
 # Usage:
 #   /project/web-classes/Fall-2025/csci5471/second2tp > ct2.bin
-#   python3 spacevote_solver.py ct2.bin /project/web-classes/Fall-2025/csci5471/hw1/ftable2.csv --passes 4 --win 14 --thr 1.2
+#   python3 beam_english_solver.py ct2.bin /project/web-classes/Fall-2025/csci5471/hw1/ftable2.csv \
+#           --restarts 8 --iters 400000 --seed 1
 
-import argparse, csv, math, collections
+import argparse, csv, math, random
 
-# Load language model (unigram + bigram) for symbols: space and A..Z
+# Load language model (unigram + bigram) over symbols: space + A..Z
 def load_lm(ftable_csv):
     rows = list(csv.reader(open(ftable_csv, newline="", encoding="utf-8", errors="replace")))
     sym = rows[0][1:]
     K = len(sym)
     counts = {}
     for r in rows[1:]:
-        if not r: 
-            continue
+        if not r: continue
         a = (r[0] or " ").strip() or " "
         for i, cell in enumerate(r[1:]):
-            try:
-                v = float(cell)
-            except:
-                v = 0.0
+            try: v = float(cell)
+            except: v = 0.0
             counts[(a, sym[i])] = v
-    row_sum = collections.Counter()
+    row_sum = {}
     for (a,b),v in counts.items():
-        row_sum[a] += v
+        row_sum[a] = row_sum.get(a, 0.0) + v
     log_big = {}
     for (a,b),v in counts.items():
-        tot = row_sum[a]
+        tot = row_sum.get(a, 0.0)
         p = (v + 1.0) / (tot + K) if tot > 0 else 1.0 / K
         log_big[(a,b)] = math.log(p)
-    col = {b: 1.0 for b in sym}
+    col = {b:1.0 for b in sym}
     for (a,b),v in counts.items():
-        col[b] += v
+        col[b] = col.get(b, 0.0) + v
     totu = sum(col.values())
     log_uni = {b: math.log(col[b] / totu) for b in sym}
     return log_uni, log_big
 
-# Convert a byte to scoring symbol (space/A..Z) and a small penalty
+# Map byte to scoring symbol (space/A..Z) and a small penalty for other bytes
 def b2sym(b):
     if b == 32: return " ", 0.0
     if 65 <= b <= 90:  return chr(b), 0.0
     if 97 <= b <= 122: return chr(b - 32), 0.0
-    return " ", -0.6
+    return " ", -1.0
 
-# Check if a byte is an ASCII letter (A..Z or a..z)
-def is_alpha(b):
-    return (65 <= b <= 90) or (97 <= b <= 122)
+# Small English word bonus to stabilize search
+def word_bonus(bs):
+    common = {"THE","AND","OF","TO","IN","A","IS","THAT","IT","FOR","AS","WITH","WAS"}
+    toks = bytes(bs).decode("utf-8", "ignore").upper().split()
+    hits = sum(1 for t in toks if t in common)
+    return 0.25 * hits
 
-# XOR two byte strings
-def bxor(a, b):
-    return bytes([x ^ y for x, y in zip(a, b)])
+# Compute objective for one plaintext and the other implied by XOR
+def total_obj(p1, X, log_uni, log_big):
+    p2 = bytes(a ^ b for a, b in zip(p1, X))
+    def score_seq(s):
+        if not s: return -1e18
+        c0,p0 = b2sym(s[0]); sc = log_uni.get(c0, -20) + p0
+        for i in range(1, len(s)):
+            a,pa = b2sym(s[i-1]); b,pb = b2sym(s[i])
+            sc += log_big.get((a,b), -20) + pb
+        return sc
+    return score_seq(p1) + score_seq(p2) + word_bonus(p1) + word_bonus(p2)
 
-# Score a short window using the language model
-def score_slice(bs, log_uni, log_big):
-    n = len(bs)
-    if n == 0:
-        return -1e9
-    c0, p0 = b2sym(bs[0])
-    s = log_uni.get(c0, -20) + p0
-    for i in range(1, n):
-        a, pa = b2sym(bs[i-1])
-        c, pc = b2sym(bs[i])
-        s += log_big.get((a, c), -20) + pc
-    return s
+# Build initial p1 by unigram greedily
+def init_p1_unigram(X, log_uni):
+    k = len(X)
+    p1 = bytearray(k)
+    alphabet = [32] + list(range(65, 91))  # ' ' + A..Z
+    for i, xi in enumerate(X):
+        best_b, best = 32, -1e18
+        for b in alphabet:
+            c1,_ = b2sym(b)
+            c2,_ = b2sym(b ^ xi)
+            sc = log_uni.get(c1, -20) + log_uni.get(c2, -20)
+            if sc > best:
+                best, best_b = sc, b
+        p1[i] = best_b
+    return p1
 
-# Recover most key bytes by space/letter voting on x=c1^c2 with LM windows
-def recover_pad_spacevote(c1, c2, log_uni, log_big, win=12, passes=3, thr=2.0):
-    k = len(c1)
-    x = bxor(c1, c2)
-    pad = [None] * k
-    voteA = [0.0] * k
-    voteB = [0.0] * k
+# Decide if x[i] looks like a letter (then require exactly one side is space)
+def letter_hint(xb):
+    ch,_ = b2sym(xb)
+    return ch != " "
 
-    for _ in range(passes):
-        for i in range(k):
-            if not is_alpha(x[i]):
-                continue
-            a = c1[i] ^ 0x20
-            b = c2[i] ^ 0x20
-            L = max(0, i - win)
-            R = min(k, i + win + 1)
-
-            wpad = pad[:]
-            wpad[i] = a
-            p1 = bytes(c1[j] ^ (wpad[j] if wpad[j] is not None else 0) for j in range(L, R))
-            p2 = bytes(c2[j] ^ (wpad[j] if wpad[j] is not None else 0) for j in range(L, R))
-            sA = score_slice(p1, log_uni, log_big) + score_slice(p2, log_uni, log_big)
-
-            wpad = pad[:]
-            wpad[i] = b
-            p1 = bytes(c1[j] ^ (wpad[j] if wpad[j] is not None else 0) for j in range(L, R))
-            p2 = bytes(c2[j] ^ (wpad[j] if wpad[j] is not None else 0) for j in range(L, R))
-            sB = score_slice(p1, log_uni, log_big) + score_slice(p2, log_uni, log_big)
-
-            voteA[i] += sA
-            voteB[i] += sB
-
-        for i in range(k):
-            if not is_alpha(x[i]):
-                continue
-            if voteA[i] - voteB[i] > thr:
-                pad[i] = c1[i] ^ 0x20
-            elif voteB[i] - voteA[i] > thr:
-                pad[i] = c2[i] ^ 0x20
-
-    for i in range(1, k - 1):
-        if pad[i] is None and pad[i-1] is not None and pad[i+1] is not None and pad[i-1] == pad[i+1]:
-            pad[i] = pad[i-1]
-
-    for i in range(k):
-        if pad[i] is None and is_alpha(x[i]):
-            pad[i] = (c1[i] ^ 0x20) if voteA[i] >= voteB[i] else (c2[i] ^ 0x20)
-
-    for i in range(k):
-        if pad[i] is None:
-            pad[i] = 0
-
-    return bytes(pad)
-
-# Fill remaining unknown key bytes by local LM search
-def patch_holes(c1, c2, pad, log_uni, log_big, iters=2, win=8):
-    k = len(c1)
-    pad = bytearray(pad)
+# Main search with annealed acceptance, warm restarts, hard constraints, local greedy kicks
+def search(X, log_uni, log_big, restarts, iters):
+    k = len(X)
     alphabet = [32] + list(range(65, 91))
-    for _ in range(iters):
-        for i in range(k):
-            if pad[i] != 0:
-                continue
-            best = pad[i]
-            bests = -1e18
-            L = max(0, i - win)
-            R = min(k, i + win + 1)
-            for guess in alphabet:
-                pad[i] = guess
-                p1 = bytes(c1[j] ^ pad[j] for j in range(L, R))
-                p2 = bytes(c2[j] ^ pad[j] for j in range(L, R))
-                s = score_slice(p1, log_uni, log_big) + score_slice(p2, log_uni, log_big)
-                if s > bests:
-                    bests = s
-                    best = guess
-            pad[i] = best
-    return bytes(pad)
 
-# CLI: read inputs, recover key, output plaintexts and pad
+    best_p1, best_val = b"", -1e18
+    for r in range(restarts):
+        if best_p1 and random.random() < 0.5:
+            p1 = bytearray(best_p1)
+            # jitter a few positions to escape basin
+            J = max(1, k // 100)
+            for _ in range(J):
+                i = random.randrange(k)
+                xi = X[i]
+                if letter_hint(xi):
+                    cands = [32, xi ^ 32]               # one side must be space
+                else:
+                    cands = alphabet
+                p1[i] = random.choice(cands)
+            warm = True
+        else:
+            p1 = init_p1_unigram(X, log_uni)
+            warm = False
+
+        cur = total_obj(p1, X, log_uni, log_big)
+        print(f"[restart {r+1}/{restarts}] start_score={cur:.3f} (warm={warm}) best_so_far={best_val:.3f}", flush=True)
+
+        for it in range(iters):
+            i = random.randrange(k)
+            xi = X[i]
+
+            if letter_hint(xi):
+                cands = [32, xi ^ 32]                  # enforce XOR-space pattern
+            else:
+                cands = alphabet
+
+            old = p1[i]
+            nb  = random.choice(cands)
+            if nb != old:
+                p1[i] = nb
+                new = total_obj(p1, X, log_uni, log_big)
+                d = new - cur
+                T = max(0.02, 1.0 - it / max(1, iters))
+                if d >= 0 or random.random() < math.exp(d / T):
+                    cur = new
+                    if cur > best_val:
+                        best_val = cur
+                        best_p1 = bytes(p1)
+                else:
+                    p1[i] = old
+
+            # local greedy every 20k iters
+            if (it + 1) % 20000 == 0:
+                j = random.randrange(k)
+                xj = X[j]
+                cands = [32, xj ^ 32] if letter_hint(xj) else alphabet
+                best_bj, best_loc = p1[j], cur
+                for bj in cands:
+                    old_bj = p1[j]
+                    p1[j] = bj
+                    sc = total_obj(p1, X, log_uni, log_big)
+                    if sc > best_loc:
+                        best_loc, best_bj = sc, bj
+                    p1[j] = old_bj
+                if best_bj != p1[j]:
+                    p1[j] = best_bj
+                    cur = best_loc
+                    if cur > best_val:
+                        best_val = cur
+                        best_p1 = bytes(p1)
+
+            if (it + 1) % 10000 == 0:
+                print(f"[restart {r+1}] iter={it+1}/{iters} score={cur:.3f} global_best={best_val:.3f}", flush=True)
+
+        print(f"[restart {r+1}] end_score={cur:.3f} global_best={best_val:.3f}", flush=True)
+
+    p2 = bytes(a ^ b for a, b in zip(best_p1, X))
+    return best_p1, p2
+
+# CLI: read inputs, run search, write outputs
 def main():
-    ap = argparse.ArgumentParser(description="Two-time-pad solver via space voting and LM windows.")
+    ap = argparse.ArgumentParser(description="Two-time-pad English-only solver (LM + constraints + warm restarts).")
     ap.add_argument("ct_bin")
     ap.add_argument("ftable_csv")
     ap.add_argument("--k", type=int, default=1024)
-    ap.add_argument("--passes", type=int, default=4)
-    ap.add_argument("--win", type=int, default=14)
-    ap.add_argument("--thr", type=float, default=1.2)
+    ap.add_argument("--restarts", type=int, default=8)
+    ap.add_argument("--iters", type=int, default=400000)
+    ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
+
+    if args.seed:
+        random.seed(args.seed)
 
     data = open(args.ct_bin, "rb").read()
     if len(data) != 2 * args.k:
         raise SystemExit(f"expected {2*args.k} bytes, got {len(data)}")
     c1, c2 = data[:args.k], data[args.k:]
+    X = bytes(a ^ b for a, b in zip(c1, c2))
 
     log_uni, log_big = load_lm(args.ftable_csv)
-    pad = recover_pad_spacevote(c1, c2, log_uni, log_big, win=args.win, passes=args.passes, thr=args.thr)
-    pad = patch_holes(c1, c2, pad, log_uni, log_big, iters=2, win=8)
+    p1, p2 = search(X, log_uni, log_big, restarts=args.restarts, iters=args.iters)
 
-    p1 = bytes(a ^ b for a, b in zip(c1, pad))
-    p2 = bytes(a ^ b for a, b in zip(c2, pad))
-
+    pad = bytes(a ^ b for a, b in zip(c1, p1))
     open("plain1.txt", "wb").write(p1)
     open("plain2.txt", "wb").write(p2)
     open("pad.bin", "wb").write(pad)
-    print("[+] Wrote plain1.txt, plain2.txt, pad.bin")
+    print("[+] wrote plain1.txt, plain2.txt, pad.bin", flush=True)
 
 if __name__ == "__main__":
     main()
