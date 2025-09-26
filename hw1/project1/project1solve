@@ -1,12 +1,6 @@
-#!/usr/bin/env python3
-# Usage:
-#   /project/web-classes/Fall-2025/csci5471/second2tp > ct2.bin
-#   python3 beam_english_solver.py ct2.bin /project/web-classes/Fall-2025/csci5471/hw1/ftable2.csv \
-#           --restarts 8 --iters 400000 --seed 1
+import argparse, csv, math, random, os, time
 
-import argparse, csv, math, random
-
-# Load language model (unigram + bigram) over symbols: space + A..Z
+# Load language model (unigram + bigram) for space + A..Z
 def load_lm(ftable_csv):
     rows = list(csv.reader(open(ftable_csv, newline="", encoding="utf-8", errors="replace")))
     sym = rows[0][1:]
@@ -34,21 +28,20 @@ def load_lm(ftable_csv):
     log_uni = {b: math.log(col[b] / totu) for b in sym}
     return log_uni, log_big
 
-# Map byte to scoring symbol (space/A..Z) and a small penalty for other bytes
+# Byte→scoring symbol (space/A..Z) + small penalty
 def b2sym(b):
     if b == 32: return " ", 0.0
     if 65 <= b <= 90:  return chr(b), 0.0
     if 97 <= b <= 122: return chr(b - 32), 0.0
     return " ", -1.0
 
-# Small English word bonus to stabilize search
+# Small English word bonus
 def word_bonus(bs):
     common = {"THE","AND","OF","TO","IN","A","IS","THAT","IT","FOR","AS","WITH","WAS"}
     toks = bytes(bs).decode("utf-8", "ignore").upper().split()
-    hits = sum(1 for t in toks if t in common)
-    return 0.25 * hits
+    return 0.25 * sum(1 for t in toks if t in common)
 
-# Compute objective for one plaintext and the other implied by XOR
+# Objective = LM(p1)+LM(p2)+word bonuses
 def total_obj(p1, X, log_uni, log_big):
     p2 = bytes(a ^ b for a, b in zip(p1, X))
     def score_seq(s):
@@ -60,11 +53,11 @@ def total_obj(p1, X, log_uni, log_big):
         return sc
     return score_seq(p1) + score_seq(p2) + word_bonus(p1) + word_bonus(p2)
 
-# Build initial p1 by unigram greedily
+# Greedy unigram init for p1
 def init_p1_unigram(X, log_uni):
     k = len(X)
     p1 = bytearray(k)
-    alphabet = [32] + list(range(65, 91))  # ' ' + A..Z
+    alphabet = [32] + list(range(65, 91))
     for i, xi in enumerate(X):
         best_b, best = 32, -1e18
         for b in alphabet:
@@ -76,27 +69,52 @@ def init_p1_unigram(X, log_uni):
         p1[i] = best_b
     return p1
 
-# Decide if x[i] looks like a letter (then require exactly one side is space)
+# If x[i] looks like letter, enforce exactly one side is space
 def letter_hint(xb):
     ch,_ = b2sym(xb)
     return ch != " "
 
-# Main search with annealed acceptance, warm restarts, hard constraints, local greedy kicks
-def search(X, log_uni, log_big, restarts, iters):
+# Save best-so-far outputs safely
+def save_outputs(c1, best_p1, X):
+    p1 = best_p1
+    p2 = bytes(a ^ b for a, b in zip(p1, X))
+    pad = bytes(a ^ b for a, b in zip(c1, p1))
+    with open("plain1.txt", "wb") as f: f.write(p1)
+    with open("plain2.txt", "wb") as f: f.write(p2)
+    with open("pad.bin",  "wb") as f: f.write(pad)
+
+# Main search: annealed, warm restarts, hard constraints, local greedy, checkpoints, max_time
+def search(c1, c2, X, log_uni, log_big, restarts, iters, save_every, max_time):
     k = len(X)
     alphabet = [32] + list(range(65, 91))
-
     best_p1, best_val = b"", -1e18
+    start_ts = time.time()
+
+    # resume if existing results found
+    if os.path.exists("plain1.txt"):
+        try:
+            prev = open("plain1.txt","rb").read()
+            if len(prev) == k:
+                best_p1 = prev
+                best_val = total_obj(prev, X, log_uni, log_big)
+                print(f"[resume] loaded plain1.txt, score={best_val:.3f}")
+        except Exception:
+            pass
+
+    step_since_save = 0
     for r in range(restarts):
+        if max_time and time.time() - start_ts > max_time:
+            print("[stop] max_time reached before new restart")
+            break
+
         if best_p1 and random.random() < 0.5:
             p1 = bytearray(best_p1)
-            # jitter a few positions to escape basin
             J = max(1, k // 100)
             for _ in range(J):
                 i = random.randrange(k)
                 xi = X[i]
                 if letter_hint(xi):
-                    cands = [32, xi ^ 32]               # one side must be space
+                    cands = [32, xi ^ 32]
                 else:
                     cands = alphabet
                 p1[i] = random.choice(cands)
@@ -109,11 +127,15 @@ def search(X, log_uni, log_big, restarts, iters):
         print(f"[restart {r+1}/{restarts}] start_score={cur:.3f} (warm={warm}) best_so_far={best_val:.3f}", flush=True)
 
         for it in range(iters):
+            if max_time and time.time() - start_ts > max_time:
+                print("[stop] max_time reached during iterations")
+                save_outputs(c1, best_p1, X)
+                return best_p1
+
             i = random.randrange(k)
             xi = X[i]
-
             if letter_hint(xi):
-                cands = [32, xi ^ 32]                  # enforce XOR-space pattern
+                cands = [32, xi ^ 32]
             else:
                 cands = alphabet
 
@@ -132,7 +154,6 @@ def search(X, log_uni, log_big, restarts, iters):
                 else:
                     p1[i] = old
 
-            # local greedy every 20k iters
             if (it + 1) % 20000 == 0:
                 j = random.randrange(k)
                 xj = X[j]
@@ -152,23 +173,33 @@ def search(X, log_uni, log_big, restarts, iters):
                         best_val = cur
                         best_p1 = bytes(p1)
 
+            step_since_save += 1
+            if save_every and step_since_save >= save_every and best_p1:
+                save_outputs(c1, best_p1, X)
+                step_since_save = 0
+
             if (it + 1) % 10000 == 0:
                 print(f"[restart {r+1}] iter={it+1}/{iters} score={cur:.3f} global_best={best_val:.3f}", flush=True)
 
         print(f"[restart {r+1}] end_score={cur:.3f} global_best={best_val:.3f}", flush=True)
+        if best_p1:
+            save_outputs(c1, best_p1, X)
 
-    p2 = bytes(a ^ b for a, b in zip(best_p1, X))
-    return best_p1, p2
+    if best_p1:
+        save_outputs(c1, best_p1, X)
+    return best_p1
 
-# CLI: read inputs, run search, write outputs
+# CLI
 def main():
-    ap = argparse.ArgumentParser(description="Two-time-pad English-only solver (LM + constraints + warm restarts).")
+    ap = argparse.ArgumentParser(description="Two-time-pad English solver with checkpoints (long-run).")
     ap.add_argument("ct_bin")
     ap.add_argument("ftable_csv")
     ap.add_argument("--k", type=int, default=1024)
-    ap.add_argument("--restarts", type=int, default=8)
-    ap.add_argument("--iters", type=int, default=400000)
+    ap.add_argument("--restarts", type=int, default=12)
+    ap.add_argument("--iters", type=int, default=5000000)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--save_every", type=int, default=20000)
+    ap.add_argument("--max_time", type=int, default=0)  # seconds, 0=unlimited
     args = ap.parse_args()
 
     if args.seed:
@@ -181,13 +212,14 @@ def main():
     X = bytes(a ^ b for a, b in zip(c1, c2))
 
     log_uni, log_big = load_lm(args.ftable_csv)
-    p1, p2 = search(X, log_uni, log_big, restarts=args.restarts, iters=args.iters)
+    best_p1 = search(c1, c2, X, log_uni, log_big,
+                     restarts=args.restarts, iters=args.iters,
+                     save_every=args.save_every, max_time=args.max_time)
 
-    pad = bytes(a ^ b for a, b in zip(c1, p1))
-    open("plain1.txt", "wb").write(p1)
-    open("plain2.txt", "wb").write(p2)
-    open("pad.bin", "wb").write(pad)
-    print("[+] wrote plain1.txt, plain2.txt, pad.bin", flush=True)
+    if best_p1:
+        print("[+] wrote plain1.txt, plain2.txt, pad.bin")
+    else:
+        print("[!] no solution saved (try larger iters/restarts or different seed)")
 
 if __name__ == "__main__":
     main()
